@@ -10,13 +10,14 @@ from datetime import datetime
 # === ✅ 認証設定（Notion） ===
 load_dotenv()  # .envファイルを読み込む
 
+GOOGLE_CREDENTIALS_PATH = os.getenv("GOOGLE_CREDENTIALS_PATH")
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
 
 # === ✅ Googleスプレッドシート認証 ===
 def authenticate_google_sheets():
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    creds = ServiceAccountCredentials.from_json_keyfile_name("./credentials.json", scope)
+    creds = ServiceAccountCredentials.from_json_keyfile_name(GOOGLE_CREDENTIALS_PATH, scope)
     return gspread.authorize(creds)
 
 # === ✅ Ping処理 ===
