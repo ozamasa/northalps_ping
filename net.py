@@ -3,6 +3,7 @@ import os
 import platform
 import gspread
 import requests
+import time
 from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime
 
@@ -74,7 +75,6 @@ def update_notion_timestamps(data, notion_token, database_id):
     create_url = "https://api.notion.com/v1/pages"
 
     for ip, timestamp in data:
-        # ① IP アドレスのページが存在するか検索
         query_payload = {
             "filter": {
                 "property": "IP Address",
@@ -87,7 +87,7 @@ def update_notion_timestamps(data, notion_token, database_id):
         results = res.json().get("results", [])
 
         if results:
-            # ② 存在する場合 → Timestamp 更新 or クリア
+            # 既存ページを更新
             page_id = results[0]["id"]
             patch_url = f"https://api.notion.com/v1/pages/{page_id}"
             patch_payload = {
@@ -98,12 +98,14 @@ def update_notion_timestamps(data, notion_token, database_id):
                 }
             }
             patch_res = requests.patch(patch_url, headers=headers, json=patch_payload)
+            time.sleep(0.4)  # ← レートリミット対策
             if patch_res.status_code == 200:
-                print(f"✅ Notion 更新: {ip} → {timestamp if timestamp else '(空白)'}")
+                action = "更新" if timestamp else "クリア"
+                print(f"✅ Notion {action}: {ip} → {timestamp if timestamp else '(空白)'}")
             else:
                 print(f"⚠️ Notion 更新失敗: {ip} - {patch_res.status_code}")
         else:
-            # ③ 存在しない場合 → 新規ページ作成
+            # 新規ページを作成
             create_payload = {
                 "parent": {"database_id": database_id},
                 "properties": {
@@ -116,6 +118,7 @@ def update_notion_timestamps(data, notion_token, database_id):
                 }
             }
             create_res = requests.post(create_url, headers=headers, json=create_payload)
+            time.sleep(0.4)  # ← レートリミット対策
             if create_res.status_code == 200:
                 print(f"🆕 Notion 新規追加: {ip} → {timestamp if timestamp else '(空白)'}")
             else:
