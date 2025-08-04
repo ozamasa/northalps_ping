@@ -75,54 +75,55 @@ def update_notion_timestamps(data, notion_token, database_id):
     create_url = "https://api.notion.com/v1/pages"
 
     for ip, timestamp in data:
-        query_payload = {
-            "filter": {
-                "property": "IP Address",
-                "title": {
-                    "equals": ip
+        try:
+            # IPアドレスでNotionページ検索
+            query_payload = {
+                "filter": {
+                    "property": "IP Address",
+                    "title": {"equals": ip}
                 }
             }
-        }
-        res = requests.post(query_url, headers=headers, json=query_payload)
-        results = res.json().get("results", [])
+            res = requests.post(query_url, headers=headers, json=query_payload)
+            res.raise_for_status()  # ここでHTTPエラーなら例外を出す
 
-        if results:
-            # 既存ページを更新
-            page_id = results[0]["id"]
-            patch_url = f"https://api.notion.com/v1/pages/{page_id}"
-            patch_payload = {
-                "properties": {
-                    "Timestamp": {
-                        "rich_text": [{"text": {"content": timestamp}}] if timestamp else {"rich_text": []}
+            results = res.json().get("results", [])
+
+            if results:
+                # ページが存在 → 更新
+                page_id = results[0]["id"]
+                patch_url = f"https://api.notion.com/v1/pages/{page_id}"
+                patch_payload = {
+                    "properties": {
+                        "Timestamp": {
+                            "rich_text": [{"text": {"content": timestamp}}] if timestamp else {"rich_text": []}
+                        }
                     }
                 }
-            }
-            patch_res = requests.patch(patch_url, headers=headers, json=patch_payload)
-            time.sleep(0.4)  # ← レートリミット対策
-            if patch_res.status_code == 200:
-                action = "更新" if timestamp else "クリア"
-                print(f"✅ Notion {action}: {ip} → {timestamp if timestamp else '(空白)'}")
+                patch_res = requests.patch(patch_url, headers=headers, json=patch_payload)
+                patch_res.raise_for_status()
+                print(f"✅ Notion 更新: {ip} → {timestamp if timestamp else '(空白)'}")
             else:
-                print(f"⚠️ Notion 更新失敗: {ip} - {patch_res.status_code}")
-        else:
-            # 新規ページを作成
-            create_payload = {
-                "parent": {"database_id": database_id},
-                "properties": {
-                    "IP Address": {
-                        "title": [{"text": {"content": ip}}]
-                    },
-                    "Timestamp": {
-                        "rich_text": [{"text": {"content": timestamp}}] if timestamp else {"rich_text": []}
+                # 存在しなければ新規追加
+                create_payload = {
+                    "parent": {"database_id": database_id},
+                    "properties": {
+                        "IP Address": {
+                            "title": [{"text": {"content": ip}}]
+                        },
+                        "Timestamp": {
+                            "rich_text": [{"text": {"content": timestamp}}] if timestamp else {"rich_text": []}
+                        }
                     }
                 }
-            }
-            create_res = requests.post(create_url, headers=headers, json=create_payload)
-            time.sleep(0.4)  # ← レートリミット対策
-            if create_res.status_code == 200:
+                create_res = requests.post(create_url, headers=headers, json=create_payload)
+                create_res.raise_for_status()
                 print(f"🆕 Notion 新規追加: {ip} → {timestamp if timestamp else '(空白)'}")
-            else:
-                print(f"❌ Notion 追加失敗: {ip} - {create_res.status_code}: {create_res.text}")
+
+        except requests.exceptions.RequestException as e:
+            print(f"❌ Notion 接続失敗: {ip} - {e}")
+
+        # レート制限回避のため待機
+        time.sleep(0.4)
 
 # === ✅ メイン処理 ===
 if __name__ == "__main__":
