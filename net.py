@@ -1,3 +1,4 @@
+from dotenv import load_dotenv
 import os
 import platform
 import gspread
@@ -6,8 +7,10 @@ from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime
 
 # === ✅ 認証設定（Notion） ===
-NOTION_TOKEN = "your_notion_token_here"
-NOTION_DATABASE_ID = "your_database_id_here"
+load_dotenv()  # .envファイルを読み込む
+
+NOTION_TOKEN = os.getenv("NOTION_TOKEN")
+NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
 
 # === ✅ Googleスプレッドシート認証 ===
 def authenticate_google_sheets():
@@ -66,9 +69,12 @@ def update_notion_timestamps(data, notion_token, database_id):
         "Content-Type": "application/json",
         "Notion-Version": "2022-06-28"
     }
+
     query_url = f"https://api.notion.com/v1/databases/{database_id}/query"
+    create_url = "https://api.notion.com/v1/pages"
 
     for ip, timestamp in data:
+        # ① IP アドレスのページが存在するか検索
         query_payload = {
             "filter": {
                 "property": "IP Address",
@@ -81,6 +87,7 @@ def update_notion_timestamps(data, notion_token, database_id):
         results = res.json().get("results", [])
 
         if results:
+            # ② 存在する場合 → Timestamp 更新 or クリア
             page_id = results[0]["id"]
             patch_url = f"https://api.notion.com/v1/pages/{page_id}"
             patch_payload = {
@@ -92,12 +99,27 @@ def update_notion_timestamps(data, notion_token, database_id):
             }
             patch_res = requests.patch(patch_url, headers=headers, json=patch_payload)
             if patch_res.status_code == 200:
-                action = "更新" if timestamp else "クリア"
-                print(f"✅ Notion {action}: {ip} → {timestamp if timestamp else '(空白)'}")
+                print(f"✅ Notion 更新: {ip} → {timestamp if timestamp else '(空白)'}")
             else:
-                print(f"⚠️ Notion更新失敗: {ip} - {patch_res.status_code}")
+                print(f"⚠️ Notion 更新失敗: {ip} - {patch_res.status_code}")
         else:
-            print(f"⚠️ NotionにIPが見つかりません: {ip}")
+            # ③ 存在しない場合 → 新規ページ作成
+            create_payload = {
+                "parent": {"database_id": database_id},
+                "properties": {
+                    "IP Address": {
+                        "title": [{"text": {"content": ip}}]
+                    },
+                    "Timestamp": {
+                        "rich_text": [{"text": {"content": timestamp}}] if timestamp else {"rich_text": []}
+                    }
+                }
+            }
+            create_res = requests.post(create_url, headers=headers, json=create_payload)
+            if create_res.status_code == 200:
+                print(f"🆕 Notion 新規追加: {ip} → {timestamp if timestamp else '(空白)'}")
+            else:
+                print(f"❌ Notion 追加失敗: {ip} - {create_res.status_code}: {create_res.text}")
 
 # === ✅ メイン処理 ===
 if __name__ == "__main__":
