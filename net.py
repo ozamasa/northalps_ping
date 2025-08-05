@@ -13,6 +13,7 @@ load_dotenv()  # .envファイルを読み込む
 GOOGLE_CREDENTIALS_PATH = os.getenv("GOOGLE_CREDENTIALS_PATH")
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
+NOTION_LOG_DATABASE_ID = os.getenv("NOTION_LOG_DATABASE_ID")
 
 # === ✅ Googleスプレッドシート認証 ===
 def authenticate_google_sheets():
@@ -76,8 +77,10 @@ def update_notion_timestamps(data, notion_token, database_id):
     create_url = "https://api.notion.com/v1/pages"
 
     for ip, timestamp in data:
+        status_text = "接続" if timestamp else ""
+
         try:
-            # IPアドレスでNotionページ検索
+            # IPアドレスでページを検索
             query_payload = {
                 "filter": {
                     "property": "IP Address",
@@ -85,26 +88,29 @@ def update_notion_timestamps(data, notion_token, database_id):
                 }
             }
             res = requests.post(query_url, headers=headers, json=query_payload)
-            res.raise_for_status()  # ここでHTTPエラーなら例外を出す
-
+            res.raise_for_status()
             results = res.json().get("results", [])
 
             if results:
-                # ページが存在 → 更新
+                # 既存ページがある → 更新
                 page_id = results[0]["id"]
                 patch_url = f"https://api.notion.com/v1/pages/{page_id}"
                 patch_payload = {
                     "properties": {
                         "Timestamp": {
-                            "rich_text": [{"text": {"content": timestamp}}] if timestamp else {"rich_text": []}
+                            "rich_text": [{"text": {"content": timestamp or ""}}]
+                        },
+                        "Status": {
+                            "rich_text": [{"text": {"content": status_text}}]
                         }
                     }
                 }
                 patch_res = requests.patch(patch_url, headers=headers, json=patch_payload)
                 patch_res.raise_for_status()
-                print(f"✅ Notion 更新: {ip} → {timestamp if timestamp else '(空白)'}")
+                print(f"✅ Notion 更新: {ip} → {timestamp or '(空白)'}, {status_text or 'Status: 空白'}")
+
             else:
-                # 存在しなければ新規追加
+                # ページがなければ新規作成
                 create_payload = {
                     "parent": {"database_id": database_id},
                     "properties": {
@@ -112,19 +118,56 @@ def update_notion_timestamps(data, notion_token, database_id):
                             "title": [{"text": {"content": ip}}]
                         },
                         "Timestamp": {
-                            "rich_text": [{"text": {"content": timestamp}}] if timestamp else {"rich_text": []}
+                            "rich_text": [{"text": {"content": timestamp or ""}}]
+                        },
+                        "Status": {
+                            "rich_text": [{"text": {"content": status_text}}]
                         }
                     }
                 }
                 create_res = requests.post(create_url, headers=headers, json=create_payload)
                 create_res.raise_for_status()
-                print(f"🆕 Notion 新規追加: {ip} → {timestamp if timestamp else '(空白)'}")
+                print(f"🆕 Notion 新規追加: {ip} → {timestamp or '(空白)'}, {status_text or 'Status: 空白'}")
 
         except requests.exceptions.RequestException as e:
-            print(f"❌ Notion 接続失敗: {ip} - {e}")
+            print(f"❌ Notion 通信エラー: {ip} - {e}")
 
-        # レート制限回避のため待機
-        time.sleep(0.4)
+        time.sleep(0.4)  # レート制限対策
+
+def log_connection_to_notion(log_db_id, ip, timestamp, notion_token):
+    status = "接続" if timestamp else "接続不可"
+    timestamp_str = timestamp or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    url = "https://api.notion.com/v1/pages"
+    headers = {
+        "Authorization": f"Bearer {notion_token}",
+        "Content-Type": "application/json",
+        "Notion-Version": "2022-06-28"
+    }
+
+    payload = {
+        "parent": { "database_id": log_db_id },
+        "properties": {
+            "IP Address": {
+                "title": [{"text": {"content": ip}}]
+            },
+            "Timestamp": {
+                "rich_text": [{"text": {"content": timestamp_str}}]
+            },
+            "Status": {
+                "rich_text": [{"text": {"content": status}}]
+            }
+        }
+    }
+
+    try:
+        res = requests.post(url, headers=headers, json=payload)
+        res.raise_for_status()
+        print(f"📝 Notion 履歴追加: {timestamp_str} | {status} | {ip}")
+    except requests.exceptions.RequestException as e:
+        print(f"⚠️ 履歴記録失敗: {ip} - {e}")
+
+    time.sleep(0.4)  # レート制限対策
 
 # === ✅ メイン処理 ===
 if __name__ == "__main__":
@@ -144,5 +187,8 @@ if __name__ == "__main__":
 
         write_to_google_sheets(ping_results, sheet_name, sheet_log_name)
         update_notion_timestamps(ping_results, NOTION_TOKEN, NOTION_DATABASE_ID)
+
+    for ip, timestamp in ping_results:
+        log_connection_to_notion(NOTION_LOG_DATABASE_ID, ip, timestamp, NOTION_TOKEN)
 
     print("✅ すべての処理が完了しました！")
