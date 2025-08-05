@@ -69,13 +69,13 @@ def update_notion_timestamps(data, token, db_id):
     for ip, timestamp in data:
         status_name = "接続" if timestamp else "接続不可"
 
-        # クエリでページを検索
         query = {
             "filter": {
                 "property": "IP Address",
                 "title": {"equals": ip}
             }
         }
+
         try:
             res = requests.post(
                 f"https://api.notion.com/v1/databases/{db_id}/query",
@@ -84,7 +84,6 @@ def update_notion_timestamps(data, token, db_id):
             res.raise_for_status()
             results = res.json().get("results", [])
 
-            # 更新 or 新規作成
             if results:
                 page_id = results[0]["id"]
                 update_payload = {
@@ -116,65 +115,34 @@ def update_notion_timestamps(data, token, db_id):
             print(f"❌ 通信エラー: {ip} - {e}")
         time.sleep(0.4)
 
-# === ✅ Notion 履歴データベースにログを追加 ===
-def log_connection_to_notion_with_relation(log_db_id, ip, timestamp, notion_token, main_db_id):
+# === ✅ Notion 履歴データベースに追加（Relationなし） ===
+def log_connection_to_notion(log_db_id, ip, timestamp, notion_token):
     status = "接続" if timestamp else "接続不可"
     timestamp_str = timestamp or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # --- 検索: メインDBから対象ページを取得 ---
-    query_url = f"https://api.notion.com/v1/databases/{main_db_id}/query"
+    url = "https://api.notion.com/v1/pages"
     headers = {
         "Authorization": f"Bearer {notion_token}",
         "Content-Type": "application/json",
         "Notion-Version": "2022-06-28"
     }
-    query_payload = {
-        "filter": {
-            "property": "IP Address",  # メインDB側のIPアドレス
-            "title": { "equals": ip }
-        }
-    }
 
-    try:
-        res = requests.post(query_url, headers=headers, json=query_payload)
-        res.raise_for_status()
-        results = res.json().get("results", [])
-        if not results:
-            print(f"⚠️ メインページが見つかりません: {ip}")
-            return
-        related_page_id = results[0]["id"]
-    except requests.exceptions.RequestException as e:
-        print(f"⚠️ 検索失敗: {ip} - {e}")
-        return
-
-    # --- 履歴ページ追加 ---
-    url = "https://api.notion.com/v1/pages"
     payload = {
-        "parent": { "database_id": log_db_id },
+        "parent": {"database_id": log_db_id},
         "properties": {
-            "Name": {
-                "title": [{"text": {"content": ip}}]
-            },
-            "Timestamp": {
-                "rich_text": [{"text": {"content": timestamp_str}}]
-            },
-            "Status": {
-                "status": {"name": status}
-            },
-            "Parent Page": {  # ← Relation列（履歴DB側）に別名を使う！
-                "relation": [{ "id": related_page_id }]
-            }
+            "IP Address": {"title": [{"text": {"content": ip}}]},
+            "Timestamp": {"rich_text": [{"text": {"content": timestamp_str}}]},
+            "Status": {"select": {"name": status}}
         }
     }
 
     try:
         res = requests.post(url, headers=headers, json=payload)
         res.raise_for_status()
-        print(f"📝 履歴追加: {timestamp_str} | {status} | {ip}")
+        print(f"📝 ログ記録: {ip} | {status} | {timestamp_str}")
     except requests.exceptions.RequestException as e:
         print(f"⚠️ ログ記録エラー: {ip} - {e}")
         print(f"📬 レスポンス: {res.text if res else 'No response'}")
-
     time.sleep(0.4)
 
 # === ✅ メイン処理 ===
@@ -196,12 +164,6 @@ if __name__ == "__main__":
         update_notion_timestamps(ping_results, NOTION_TOKEN, NOTION_DATABASE_ID)
 
         for ip, ts in ping_results:
-            log_connection_to_notion_with_relation(
-                NOTION_LOG_DATABASE_ID,
-                ip,
-                ts,
-                NOTION_TOKEN,
-                NOTION_DATABASE_ID
-            )
+            log_connection_to_notion(NOTION_LOG_DATABASE_ID, ip, ts, NOTION_TOKEN)
 
     print("🏁 全処理完了！")
