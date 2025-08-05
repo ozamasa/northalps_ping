@@ -196,6 +196,6 @@ if __name__ == "__main__":
         update_notion_timestamps(ping_results, NOTION_TOKEN, NOTION_DATABASE_ID)
 
         for ip, ts in ping_results:
-            log_connection_to_notion(NOTION_LOG_DATABASE_ID, ip, ts, NOTION_TOKEN)
+            log_connection_to_notion(NOTION_LOG_DATABASE_ID, ip, ts, NOTION_TOKEN, NOTION_DATABASE_ID)
 
     print("🏁 全処理完了！")
