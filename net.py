@@ -90,7 +90,7 @@ def update_notion_timestamps(data, token, db_id):
                 update_payload = {
                     "properties": {
                         "Timestamp": {"rich_text": [{"text": {"content": timestamp or ""}}]},
-                        "Status": {"status": {"name": status_name}}
+                        "Status": {"select": {"name": status_name}}
                     }
                 }
                 patch = requests.patch(
@@ -105,7 +105,7 @@ def update_notion_timestamps(data, token, db_id):
                     "properties": {
                         "IP Address": {"title": [{"text": {"content": ip}}]},
                         "Timestamp": {"rich_text": [{"text": {"content": timestamp or ""}}]},
-                        "Status": {"status": {"name": status_name}}
+                        "Status": {"select": {"name": status_name}}
                     }
                 }
                 create = requests.post("https://api.notion.com/v1/pages", headers=headers, json=create_payload)
@@ -132,7 +132,7 @@ def log_connection_to_notion(db_id, ip, timestamp, token):
         "properties": {
             "IP Address": {"title": [{"text": {"content": ip}}]},
             "Timestamp": {"rich_text": [{"text": {"content": timestamp_str}}]},
-            "Status": {"status": {"name": status}}
+            "Status": {"select": {"name": status}}
         }
     }
 
