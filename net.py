@@ -59,7 +59,7 @@ def write_to_google_sheets(data, sheet_name, sheet_log_name):
     log_sheet.insert_cols([column], col=2)
 
 # === ✅ heading の直後に新しい paragraph を「先頭に」追加
-def prepend_log_after_heading(ip, timestamp, token, db_id):
+def prepend_log_to_page(ip, timestamp, token, db_id):
     status = "接続" if timestamp else "接続不可"
     timestamp_str = timestamp or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     new_log_block = {
@@ -82,13 +82,13 @@ def prepend_log_after_heading(ip, timestamp, token, db_id):
     }
 
     # === ページID取得 ===
-    query = {
-        "filter": {
-            "property": "IP Address",
-            "title": {"equals": ip}
-        }
-    }
     try:
+        query = {
+            "filter": {
+                "property": "IP Address",
+                "title": {"equals": ip}
+            }
+        }
         res = requests.post(f"https://api.notion.com/v1/databases/{db_id}/query", headers=headers, json=query)
         res.raise_for_status()
         results = res.json()["results"]
@@ -97,86 +97,43 @@ def prepend_log_after_heading(ip, timestamp, token, db_id):
             return
         page_id = results[0]["id"]
     except Exception as e:
-        print(f"❌ 検索失敗: {ip} - {e}")
+        print(f"❌ ページ取得失敗: {ip} - {e}")
         return
 
-    # === ページの children を取得して heading_2 を探す ===
+    # === ページの children（全履歴）取得 ===
     try:
         children_url = f"https://api.notion.com/v1/blocks/{page_id}/children?page_size=100"
         res = requests.get(children_url, headers=headers)
         res.raise_for_status()
-        blocks = res.json()["results"]
+        children = res.json()["results"]
 
-        heading_index = -1
-        heading_id = None
-        for i, block in enumerate(blocks):
-            if block["type"] == "heading_2" and "通信履歴" in block["heading_2"]["rich_text"][0]["text"]["content"]:
-                heading_index = i
-                heading_id = block["id"]
-                break
+        # 既存 paragraph ブロックだけを対象とする
+        old_logs = [block for block in children if block["type"] == "paragraph"]
 
-        # heading_2 がなければ作成して末尾に追加
-        if heading_id is None:
-            create_heading = {
-                "children": [
-                    {
-                        "object": "block",
-                        "type": "heading_2",
-                        "heading_2": {
-                            "rich_text": [
-                                {
-                                    "type": "text",
-                                    "text": {"content": "通信履歴"}
-                                }
-                            ]
-                        }
-                    }
-                ]
-            }
-            res = requests.patch(children_url, headers=headers, json=create_heading)
-            res.raise_for_status()
-            new_heading_block = res.json().get("results", [])[0]
-            heading_id = new_heading_block["id"]
-            heading_index = len(blocks)  # 新しく末尾に追加された
+        # 最大100件まで保持（新しいもの含めて）
+        remaining_logs = old_logs[:99]  # 新規追加分と合わせて最大100にする
 
-            # 最初のログだけ追加して終わり
-            res = requests.patch(
-                f"https://api.notion.com/v1/blocks/{heading_id}/children",
-                headers=headers,
-                json={"children": [new_log_block]}
-            )
-            res.raise_for_status()
-            print(f"🆕 通信履歴 heading 作成 & 初回ログ追加: {ip} | {timestamp_str} | {status}")
-            return
-
-        # === heading の次にある paragraph をログとみなして取得 ===
-        log_blocks = []
-        for block in blocks[heading_index + 1:]:
-            if block["type"] != "paragraph":
-                break
-            log_blocks.append(block)
-
-        # ログの最大件数を制限（100件まで）
-        existing_blocks_to_keep = log_blocks[:99]  # 新しいのを1件追加するから
-        old_blocks_to_delete = log_blocks[99:]
-
-        for block in old_blocks_to_delete:
+        # 古いログを削除
+        for block in old_logs[99:]:
             try:
                 requests.delete(f"https://api.notion.com/v1/blocks/{block['id']}", headers=headers)
             except Exception as e:
-                print(f"⚠️ 古いログ削除失敗: {block['id']} - {e}")
+                print(f"⚠️ ログ削除失敗: {block['id']} - {e}")
 
-        # === 新しいログを heading の直下に追加 ===
-        res = requests.patch(
-            f"https://api.notion.com/v1/blocks/{heading_id}/children",
-            headers=headers,
-            json={"children": [new_log_block]}
-        )
-        res.raise_for_status()
-        print(f"📎 ログ追加（降順）: {ip} | {timestamp_str} | {status}")
+        # 全 paragraph を削除（再構成するため）
+        for block in old_logs[:99]:
+            try:
+                requests.delete(f"https://api.notion.com/v1/blocks/{block['id']}", headers=headers)
+            except Exception as e:
+                print(f"⚠️ 削除失敗: {block['id']} - {e}")
+
+        # 新しい paragraph を先頭に追加し、古いログを続けて再追加
+        new_children = [new_log_block] + remaining_logs
+        requests.patch(f"https://api.notion.com/v1/blocks/{page_id}/children", headers=headers, json={"children": new_children})
+        print(f"📎 履歴追記: {ip} | {timestamp_str} | {status}")
 
     except Exception as e:
-        print(f"❌ heading 処理失敗: {ip} - {e}")
+        print(f"❌ ログ更新失敗: {ip} - {e}")
 
 # === ✅ Notion に最新の接続状況を更新 + childrenに履歴追加 ===
 def update_notion_timestamps(data, token, db_id):
@@ -222,7 +179,7 @@ def update_notion_timestamps(data, token, db_id):
                     page_id = res.json()["id"]
                     ip_to_page_id[ip] = page_id
                     print(f"🆕 新規: {ip} | {status_name} | {timestamp or '―'}")
-                    prepend_log_after_heading(ip, timestamp, token, db_id)
+                    prepend_log_to_page(ip, timestamp, token, db_id)
                     time.sleep(random.uniform(0.6, 0.8))
                     continue
             except requests.exceptions.RequestException as e:
@@ -241,7 +198,7 @@ def update_notion_timestamps(data, token, db_id):
 
             if current_timestamp == (timestamp or "") and current_status == status_name:
                 print(f"🔁 履歴のみ追記（プロパティ変更なし）: {ip}")
-                prepend_log_after_heading(ip, timestamp, token, db_id)
+                prepend_log_to_page(ip, timestamp, token, db_id)
                 time.sleep(random.uniform(0.6, 0.8))
                 continue
 
@@ -263,7 +220,7 @@ def update_notion_timestamps(data, token, db_id):
             )
             patch.raise_for_status()
             print(f"✅ 更新: {ip} | {status_name} | {timestamp or '―'}")
-            prepend_log_after_heading(ip, timestamp, token, db_id)
+            prepend_log_to_page(ip, timestamp, token, db_id)
 
         except requests.exceptions.RequestException as e:
             print(f"❌ プロパティ更新失敗: {ip} - {e}")
