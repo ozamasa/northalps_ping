@@ -4,6 +4,7 @@ import platform
 import gspread
 import requests
 import time
+import random
 from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime
 
@@ -57,10 +58,22 @@ def write_to_google_sheets(data, sheet_name, sheet_log_name):
     column += [ts for _, ts in data]
     log_sheet.insert_cols([column], col=2)
 
-# === ✅ Notion ページの children に履歴を追記 ===
-def append_log_to_notion_page_children(ip, timestamp, token, db_id):
+# === ✅ heading の直後に新しい paragraph を「先頭に」追加
+def prepend_log_under_heading(ip, timestamp, token, db_id):
     status = "接続" if timestamp else "接続不可"
     timestamp_str = timestamp or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    new_log_block = {
+        "object": "block",
+        "type": "paragraph",
+        "paragraph": {
+            "rich_text": [
+                {
+                    "type": "text",
+                    "text": {"content": f"{timestamp_str} | {status}"}
+                }
+            ]
+        }
+    }
 
     headers = {
         "Authorization": f"Bearer {token}",
@@ -68,54 +81,100 @@ def append_log_to_notion_page_children(ip, timestamp, token, db_id):
         "Notion-Version": "2022-06-28"
     }
 
+    # === ページID取得 ===
     query = {
         "filter": {
             "property": "IP Address",
             "title": {"equals": ip}
         }
     }
-
     try:
         res = requests.post(f"https://api.notion.com/v1/databases/{db_id}/query", headers=headers, json=query)
         res.raise_for_status()
-        results = res.json().get("results", [])
+        results = res.json()["results"]
         if not results:
             print(f"⚠️ ページが見つかりません（{ip}）")
             return
         page_id = results[0]["id"]
-    except requests.exceptions.RequestException as e:
-        print(f"⚠️ 検索失敗: {ip} - {e}")
+    except Exception as e:
+        print(f"❌ 検索失敗: {ip} - {e}")
         return
 
-    url = f"https://api.notion.com/v1/blocks/{page_id}/children"
-    block_payload = {
-        "children": [
-            {
-                "object": "block",
-                "type": "paragraph",
-                "paragraph": {
-                    "rich_text": [
-                        {
-                            "type": "text",
-                            "text": {
-                                "content": f"{timestamp_str} | {status}"
-                            }
-                        }
-                    ]
-                }
-            }
-        ]
-    }
-
+    # === ページの children を取得して heading_2 を探す ===
     try:
-        append = requests.patch(url, headers=headers, json=block_payload)
-        append.raise_for_status()
-        print(f"📎 履歴追記: {ip} | {timestamp_str} | {status}")
-    except requests.exceptions.RequestException as e:
-        print(f"⚠️ children 書き込み失敗: {ip} - {e}")
-        print(f"📬 レスポンス: {append.text if append else 'No response'}")
+        # ⚠️ 注意: 最大100件までの履歴のみ取得・再構成します。
+        # それ以上は削除される仕様です（長期保存不要な方針に基づく）。
+        children_url = f"https://api.notion.com/v1/blocks/{page_id}/children?page_size=100"
+        res = requests.get(children_url, headers=headers)
+        res.raise_for_status()
+        blocks = res.json()["results"]
 
-    time.sleep(0.4)
+        heading_index = -1
+        heading_id = None
+        for i, block in enumerate(blocks):
+            if block["type"] == "heading_2" and "通信履歴" in block["heading_2"]["rich_text"][0]["text"]["content"]:
+                heading_index = i
+                heading_id = block["id"]
+                break
+
+        if heading_id is None:
+            # heading_2 がない場合は作る
+            new_heading = {
+                "children": [
+                    {
+                        "object": "block",
+                        "type": "heading_2",
+                        "heading_2": {
+                            "rich_text": [
+                                {
+                                    "type": "text",
+                                    "text": {"content": "通信履歴"}
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+            res_heading = requests.patch(children_url, headers=headers, json=new_heading)
+            res_heading.raise_for_status()
+            heading_id = res_heading.json()["results"][0]["id"]
+            heading_index = len(blocks)  # 新しく追加されたので最後
+            print(f"🆕 通信履歴 heading 作成: {ip}")
+            # 子ブロックなしなのでそのまま新しいログだけ追加して return
+            requests.patch(f"https://api.notion.com/v1/blocks/{heading_id}/children", headers=headers, json={"children": [new_log_block]})
+            print(f"📎 初回ログ追記: {ip} | {timestamp_str} | {status}")
+            return
+
+    except Exception as e:
+        print(f"❌ heading 検出失敗: {ip} - {e}")
+        return
+
+    # === heading の子ブロック（ログ）を取得 ===
+    try:
+        res = requests.get(f"https://api.notion.com/v1/blocks/{heading_id}/children?page_size=100", headers=headers)
+        res.raise_for_status()
+        current_children = res.json()["results"]
+
+        # 古いブロックIDを取得
+        old_block_ids = [block["id"] for block in current_children]
+
+        # 新しいログを先頭に
+        new_children = [new_log_block] + current_children
+
+        # 全削除
+        for block_id in old_block_ids:
+            try:
+                requests.delete(f"https://api.notion.com/v1/blocks/{block_id}", headers=headers)
+            except Exception as e:
+                print(f"⚠️ 削除失敗: {block_id} - {e}")
+
+        # 新しく並べ替えたものを追加
+        res = requests.patch(f"https://api.notion.com/v1/blocks/{heading_id}/children", headers=headers, json={"children": new_children})
+        res.raise_for_status()
+        print(f"📎 ログ先頭追加: {ip} | {timestamp_str} | {status}")
+
+    except Exception as e:
+        print(f"❌ heading 子の更新失敗: {ip} - {e}")
 
 # === ✅ Notion に最新の接続状況を更新 + childrenに履歴追加 ===
 def update_notion_timestamps(data, token, db_id):
@@ -125,54 +184,93 @@ def update_notion_timestamps(data, token, db_id):
         "Notion-Version": "2022-06-28"
     }
 
+    ip_to_page_id = {}  # IPアドレスとページIDのキャッシュ
+
     for ip, timestamp in data:
         status_name = "接続" if timestamp else "接続不可"
 
-        query = {
-            "filter": {
-                "property": "IP Address",
-                "title": {"equals": ip}
+        # === 1. ページIDをキャッシュから取得 or Notionから取得 ===
+        if ip not in ip_to_page_id:
+            query = {
+                "filter": {
+                    "property": "IP Address",
+                    "title": {"equals": ip}
+                }
             }
-        }
-
-        try:
-            res = requests.post(
-                f"https://api.notion.com/v1/databases/{db_id}/query",
-                headers=headers, json=query
-            )
-            res.raise_for_status()
-            results = res.json().get("results", [])
-
-            if results:
-                page_id = results[0]["id"]
-                update_payload = {
-                    "properties": {
-                        "Timestamp": {"rich_text": [{"text": {"content": timestamp or ""}}]},
-                        "Status": {"select": {"name": status_name}}
-                    }
-                }
-                patch = requests.patch(
-                    f"https://api.notion.com/v1/pages/{page_id}",
-                    headers=headers, json=update_payload
+            try:
+                res = requests.post(
+                    f"https://api.notion.com/v1/databases/{db_id}/query",
+                    headers=headers, json=query
                 )
-                patch.raise_for_status()
-                print(f"✅ 更新: {ip} | {status_name} | {timestamp or '―'}")
-                append_log_to_notion_page_children(ip, timestamp, token, db_id)
-            else:
-                create_payload = {
-                    "parent": {"database_id": db_id},
-                    "properties": {
-                        "IP Address": {"title": [{"text": {"content": ip}}]},
-                        "Timestamp": {"rich_text": [{"text": {"content": timestamp or ""}}]},
-                        "Status": {"select": {"name": status_name}}
+                res.raise_for_status()
+                results = res.json().get("results", [])
+                if results:
+                    page_id = results[0]["id"]
+                    ip_to_page_id[ip] = page_id
+                else:
+                    # 新規作成
+                    create_payload = {
+                        "parent": {"database_id": db_id},
+                        "properties": {
+                            "IP Address": {"title": [{"text": {"content": ip}}]},
+                            "Timestamp": {"rich_text": [{"text": {"content": timestamp or ""}}]},
+                            "Status": {"select": {"name": status_name}}
+                        }
                     }
-                }
-                create = requests.post("https://api.notion.com/v1/pages", headers=headers, json=create_payload)
-                create.raise_for_status()
-                print(f"🆕 新規: {ip} | {status_name} | {timestamp or '―'}")
+                    res = requests.post("https://api.notion.com/v1/pages", headers=headers, json=create_payload)
+                    res.raise_for_status()
+                    page_id = res.json()["id"]
+                    ip_to_page_id[ip] = page_id
+                    print(f"🆕 新規: {ip} | {status_name} | {timestamp or '―'}")
+                    # 初回作成時のみログを追加して、次のIPへ
+                    prepend_log_under_heading(ip, timestamp, token, db_id)
+                    time.sleep(random.uniform(0.6, 0.8))
+                    continue
+            except requests.exceptions.RequestException as e:
+                print(f"❌ 通信エラー（ページ検索/作成）: {ip} - {e}")
+                time.sleep(random.uniform(0.6, 0.8))
+                continue
+
+        # === 2. 既存プロパティを取得（重複更新を防ぐ） ===
+        page_id = ip_to_page_id[ip]
+        try:
+            page_url = f"https://api.notion.com/v1/pages/{page_id}"
+            res = requests.get(page_url, headers=headers)
+            res.raise_for_status()
+            properties = res.json()["properties"]
+            current_timestamp = properties.get("Timestamp", {}).get("rich_text", [{}])[0].get("text", {}).get("content", "")
+            current_status = properties.get("Status", {}).get("select", {}).get("name", "")
+
+            if current_timestamp == (timestamp or "") and current_status == status_name:
+                print(f"⏭ スキップ: {ip}（変更なし）")
+                continue
+
         except requests.exceptions.RequestException as e:
-            print(f"❌ 通信エラー: {ip} - {e}")
-        time.sleep(0.4)
+            print(f"⚠️ 現在のプロパティ取得失敗: {ip} - {e}")
+            time.sleep(random.uniform(0.6, 0.8))
+            continue
+
+        # === 3. 更新が必要な場合のみ Patch + ログ追記 ===
+        try:
+            update_payload = {
+                "properties": {
+                    "Timestamp": {"rich_text": [{"text": {"content": timestamp or ""}}]},
+                    "Status": {"select": {"name": status_name}}
+                }
+            }
+            patch = requests.patch(
+                f"https://api.notion.com/v1/pages/{page_id}",
+                headers=headers, json=update_payload
+            )
+            patch.raise_for_status()
+            print(f"✅ 更新: {ip} | {status_name} | {timestamp or '―'}")
+            prepend_log_under_heading(ip, timestamp, token, db_id)
+
+        except requests.exceptions.RequestException as e:
+            print(f"❌ プロパティ更新失敗: {ip} - {e}")
+
+        # レート制限回避のために少し待つ
+        time.sleep(random.uniform(0.6, 0.8))
 
 # === ✅ メイン処理 ===
 if __name__ == "__main__":
