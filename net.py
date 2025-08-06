@@ -100,7 +100,6 @@ def prepend_log_after_heading(ip, timestamp, token, db_id):
         print(f"❌ 検索失敗: {ip} - {e}")
         return
 
-    # === ページの children を取得して heading_2 を探す ===
     try:
         children_url = f"https://api.notion.com/v1/blocks/{page_id}/children?page_size=100"
         res = requests.get(children_url, headers=headers)
@@ -115,7 +114,6 @@ def prepend_log_after_heading(ip, timestamp, token, db_id):
                 heading_id = block["id"]
                 break
 
-        # heading_2 がなければ作成して末尾に追加
         if heading_id is None:
             new_heading = {
                 "children": [
@@ -137,7 +135,6 @@ def prepend_log_after_heading(ip, timestamp, token, db_id):
             res_heading.raise_for_status()
             heading_id = res_heading.json()["results"][0]["id"]
             print(f"🆕 通信履歴 heading 作成: {ip}")
-            # 再度 children を取得して、heading の位置を取得し直す
             res = requests.get(children_url, headers=headers)
             res.raise_for_status()
             blocks = res.json()["results"]
@@ -146,14 +143,12 @@ def prepend_log_after_heading(ip, timestamp, token, db_id):
                     heading_index = i
                     break
 
-        # 既存の paragraph を収集（heading の次にある連続 paragraph をログとみなす）
         log_blocks = []
         for block in blocks[heading_index + 1:]:
             if block["type"] != "paragraph":
                 break
             log_blocks.append(block)
 
-        # 古いブロックID（100件以降）を削除
         if len(log_blocks) >= 100:
             for block in log_blocks[99:]:
                 try:
@@ -161,7 +156,6 @@ def prepend_log_after_heading(ip, timestamp, token, db_id):
                 except Exception as e:
                     print(f"⚠️ 古いログ削除失敗: {block['id']} - {e}")
 
-        # heading_2 の直後に新しい paragraph を挿入
         insert_url = f"https://api.notion.com/v1/blocks/{page_id}/children"
         res = requests.patch(
             insert_url,
@@ -185,12 +179,11 @@ def update_notion_timestamps(data, token, db_id):
         "Notion-Version": "2022-06-28"
     }
 
-    ip_to_page_id = {}  # IPアドレスとページIDのキャッシュ
+    ip_to_page_id = {}
 
     for ip, timestamp in data:
         status_name = "接続" if timestamp else "接続不可"
 
-        # === 1. ページIDをキャッシュから取得 or Notionから取得 ===
         if ip not in ip_to_page_id:
             query = {
                 "filter": {
@@ -209,7 +202,6 @@ def update_notion_timestamps(data, token, db_id):
                     page_id = results[0]["id"]
                     ip_to_page_id[ip] = page_id
                 else:
-                    # 新規作成
                     create_payload = {
                         "parent": {"database_id": db_id},
                         "properties": {
@@ -223,7 +215,6 @@ def update_notion_timestamps(data, token, db_id):
                     page_id = res.json()["id"]
                     ip_to_page_id[ip] = page_id
                     print(f"🆕 新規: {ip} | {status_name} | {timestamp or '―'}")
-                    # 初回作成時のみログを追加して、次のIPへ
                     prepend_log_after_heading(ip, timestamp, token, db_id)
                     time.sleep(random.uniform(0.6, 0.8))
                     continue
@@ -232,7 +223,6 @@ def update_notion_timestamps(data, token, db_id):
                 time.sleep(random.uniform(0.6, 0.8))
                 continue
 
-        # === 2. 既存プロパティを取得（重複更新を防ぐ） ===
         page_id = ip_to_page_id[ip]
         try:
             page_url = f"https://api.notion.com/v1/pages/{page_id}"
@@ -253,7 +243,6 @@ def update_notion_timestamps(data, token, db_id):
             time.sleep(random.uniform(0.6, 0.8))
             continue
 
-        # === 3. 更新が必要な場合のみ Patch + ログ追記 ===
         try:
             update_payload = {
                 "properties": {
@@ -272,7 +261,6 @@ def update_notion_timestamps(data, token, db_id):
         except requests.exceptions.RequestException as e:
             print(f"❌ プロパティ更新失敗: {ip} - {e}")
 
-        # レート制限回避のために少し待つ
         time.sleep(random.uniform(0.6, 0.8))
 
 # === ✅ メイン処理 ===
