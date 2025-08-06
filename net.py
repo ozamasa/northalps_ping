@@ -204,7 +204,7 @@ def update_notion_timestamps(data, token, db_id):
 
         except requests.exceptions.RequestException as e:
             print(f"⚠️ 現在のプロパティ取得失敗: {ip} - {e}")
-            time.sleep(random.uniform(0.6, 0.8))
+            time.sleep(0.3)
             continue
 
         try:
@@ -225,7 +225,7 @@ def update_notion_timestamps(data, token, db_id):
         except requests.exceptions.RequestException as e:
             print(f"❌ プロパティ更新失敗: {ip} - {e}")
 
-        time.sleep(random.uniform(0.6, 0.8))
+        time.sleep(0.3)
 
 # === ✅ メイン処理 ===
 if __name__ == "__main__":
