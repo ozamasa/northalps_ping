@@ -242,7 +242,9 @@ def update_notion_timestamps(data, token, db_id):
             current_status = properties.get("Status", {}).get("select", {}).get("name", "")
 
             if current_timestamp == (timestamp or "") and current_status == status_name:
-                print(f"⏭ スキップ: {ip}（変更なし）")
+                print(f"🔁 履歴のみ追記（プロパティ変更なし）: {ip}")
+                prepend_log_under_heading(ip, timestamp, token, db_id)
+                time.sleep(random.uniform(0.6, 0.8))
                 continue
 
         except requests.exceptions.RequestException as e:
