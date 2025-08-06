@@ -161,9 +161,16 @@ def prepend_log_after_heading(ip, timestamp, token, db_id):
                 except Exception as e:
                     print(f"⚠️ 古いログ削除失敗: {block['id']} - {e}")
 
-        # 新しい paragraph を heading の「すぐ下」に追加
-        insert_url = f"https://api.notion.com/v1/blocks/{heading_id}/children"
-        res = requests.patch(insert_url, headers=headers, json={"children": [new_log_block]})
+        # heading_2 の直後に新しい paragraph を挿入
+        insert_url = f"https://api.notion.com/v1/blocks/{page_id}/children"
+        res = requests.patch(
+            insert_url,
+            headers=headers,
+            json={
+                "children": [new_log_block],
+                "after": heading_id
+            }
+        )
         res.raise_for_status()
         print(f"📎 ログ追加（降順）: {ip} | {timestamp_str} | {status}")
 
