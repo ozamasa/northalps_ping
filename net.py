@@ -162,7 +162,7 @@ def create_log_record(ip, timestamp, status_name, network_prefix=None):
         return
     ts_iso = timestamp.replace(" ", "T") if timestamp else None
     props = {
-        "IP": {"title": [{"text": {"content": ip}}]},
+        "IP Address": {"title": [{"text": {"content": ip}}]},
         "Status": {"select": {"name": status_name}},
     }
     if ts_iso:
