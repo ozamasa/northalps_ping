@@ -11,9 +11,9 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 # ========= 設定 =========
-PING_WORKERS   = 100     # 並列ping
-NOTION_TIMEOUT = 10      # Notion API タイムアウト
-NOTION_BACKOFF = 0.4     # Notion ページング間隔(429対策)
+PING_WORKERS    = 100   # 並列ping数（Piなら80〜128目安）
+NOTION_TIMEOUT  = 10    # Notion API タイムアウト秒
+NOTION_BACKOFF  = 0.4   # Notion DBページング時の待ち(429対策)
 
 # ========= ENV =========
 load_dotenv()
@@ -29,20 +29,21 @@ NOTION_HEADERS = {
     "Notion-Version": "2022-06-28",
 }
 
-# ========= HTTP Session =========
-def _session():
+# ========= HTTP Session（安定＋再試行） =========
+def create_session():
     s = requests.Session()
-    r = Retry(
+    retry = Retry(
         total=5, connect=5, read=5,
         backoff_factor=0.5,
         status_forcelist=(429, 500, 502, 503, 504),
         allowed_methods=frozenset(["GET", "POST", "PATCH"])
     )
-    ad = HTTPAdapter(max_retries=r, pool_connections=20, pool_maxsize=50)
-    s.mount("https://", ad); s.mount("http://", ad)
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=50)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
     return s
 
-S = _session()
+S = create_session()
 
 # ========= Google Sheets =========
 def gs_auth():
@@ -54,7 +55,10 @@ def gs_auth():
     return gspread.authorize(creds)
 
 def write_to_sheets_with_backup(data, sheet_name, log_sheet_name):
-    """メイン上書き + 旧メインB列をログ右端へ退避 + 今回結果をログ右端へ追加"""
+    """
+    メイン上書き + 旧メインB列をログ右端へ退避 + 今回結果もログ右端へ追加
+    （メインは可読のためローカル時刻 "YYYY-MM-DD HH:MM:SS"）
+    """
     gc = gs_auth()
     ss = gc.open(SPREADSHEET_NAME)
 
@@ -72,11 +76,11 @@ def write_to_sheets_with_backup(data, sheet_name, log_sheet_name):
         ips = [ip for ip, _ in data]
         log_sheet.update([["IP Address"] + ips], range_name="A1")
 
-    # 退避（旧B列→ログ右端）
+    # 退避：現B列→ログ右端
     try:
-        current_vals = sheet.get_all_values()
-        if current_vals and len(current_vals) >= 2:
-            prev_col = [row[1] if len(row) > 1 else "" for row in current_vals[1:]]
+        current = sheet.get_all_values()
+        if current and len(current) >= 2:
+            prev_col = [row[1] if len(row) > 1 else "" for row in current[1:]]
             backup_col = [datetime.now().strftime("%Y-%m-%d %H:%M:%S")] + prev_col
             col_count = log_sheet.col_count
             if log_sheet.col_count < col_count + 1:
@@ -88,9 +92,12 @@ def write_to_sheets_with_backup(data, sheet_name, log_sheet_name):
 
     # メイン上書き
     values = [["IP Address", "Timestamp"]] + data
-    sheet.batch_update([{"range": f"A1:B{len(values)}", "values": values}])
+    sheet.batch_update([{
+        "range": f"A1:B{len(values)}",
+        "values": values
+    }])
 
-    # 今回の結果をログ右端に追加
+    # 今回分をログ右端に追加
     col_count = log_sheet.col_count
     run_col = [datetime.now().strftime("%Y-%m-%d %H:%M:%S")] + [ts for _, ts in data]
     if log_sheet.col_count < col_count + 1:
@@ -111,20 +118,26 @@ def ping_ip(ip):
 
 def ping_subnet(prefix, workers=PING_WORKERS):
     ips = [f"{prefix}{i}" for i in range(1, 255)]
-    ts_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    results = []
+    # Notion向けは ISO（date型用）、Sheets向けは可読
+    ts_iso = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    ts_human = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    results = []            # [[ip, human_ts or ""]]
+    results_iso = []        # [[ip, iso_ts or ""]]
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futs = {ex.submit(ping_ip, ip): ip for ip in ips}
         for fut in as_completed(futs):
             ip = futs[fut]
             ok = fut.result()
-            results.append([ip, ts_now if ok else ""])
+            results.append([ip, ts_human if ok else ""])
+            results_iso.append([ip, ts_iso if ok else ""])
     results.sort(key=lambda x: int(x[0].split(".")[-1]))
-    return results
+    results_iso.sort(key=lambda x: int(x[0].split(".")[-1]))
+    return results, results_iso
 
-# ========= Notion =========
+# ========= Notion（差分判定は DB query のみで） =========
 def fetch_pages_map(db_id):
-    """ip -> {'id': page_id, 'ts': TEXT, 'status': SELECT}"""
+    """ip -> {'id': page_id, 'ts': 'ISO or ""', 'status': '接続/接続不可'}"""
     page_map = {}
     url = f"https://api.notion.com/v1/databases/{db_id}/query"
     payload = {"page_size": 100}
@@ -138,7 +151,12 @@ def fetch_pages_map(db_id):
             ip = title[0]["text"]["content"] if title else None
             if not ip:
                 continue
-            ts = props.get("Timestamp", {}).get("rich_text", [{}])[0].get("text", {}).get("content", "")
+            # date型の start を拾う（無ければ ""）
+            ts = ""
+            try:
+                ts = (props.get("Timestamp", {}) or {}).get("date", {}).get("start", "") or ""
+            except Exception:
+                pass
             status = props.get("Status", {}).get("select", {}).get("name", "")
             page_map[ip] = {"id": row["id"], "ts": ts, "status": status}
         if not data.get("has_more"):
@@ -147,87 +165,118 @@ def fetch_pages_map(db_id):
         time.sleep(NOTION_BACKOFF)
     return page_map
 
-def create_log_record(ip, timestamp, status_name, network_prefix=None):
-    """ログDBに1行追加（TimestampはTEXT）"""
+# ログDBのスキーマ（存在チェック）
+def get_db_properties(db_id):
+    try:
+        r = S.get(f"https://api.notion.com/v1/databases/{db_id}", headers=NOTION_HEADERS, timeout=NOTION_TIMEOUT)
+        r.raise_for_status()
+        return r.json().get("properties", {})
+    except requests.exceptions.RequestException:
+        return {}
+
+LOG_DB_PROPS = get_db_properties(NOTION_LOGS_DB_ID) if NOTION_LOGS_DB_ID else {}
+
+def has_prop(props, name, type_):
+    p = props.get(name)
+    return p and p.get("type") == type_
+
+def create_log_record(ip, ts_iso, status_name, network_prefix=None):
+    """ログDBへ1行（Timestamp は date型、未接続はdate None）"""
     if not NOTION_LOGS_DB_ID:
         return
-    props = {
-        "IP Address": {"title": [{"text": {"content": ip}}]},
-        "Status": {"select": {"name": status_name}},
-        "Timestamp": {"rich_text": [{"text": {"content": timestamp or ""}}]},
-    }
-    if network_prefix:
+
+    props = {}
+    if has_prop(LOG_DB_PROPS, "IP Address", "title"):
+        props["IP Address"] = {"title": [{"text": {"content": ip}}]}
+    else:
+        # title が無いDBにはページ作れない
+        return
+
+    if has_prop(LOG_DB_PROPS, "Status", "select"):
+        props["Status"] = {"select": {"name": status_name}}
+
+    if has_prop(LOG_DB_PROPS, "Timestamp", "date"):
+        props["Timestamp"] = {"date": {"start": ts_iso}} if ts_iso else {"date": None}
+
+    if network_prefix and has_prop(LOG_DB_PROPS, "Network", "select"):
         props["Network"] = {"select": {"name": network_prefix}}
+
     payload = {"parent": {"database_id": NOTION_LOGS_DB_ID}, "properties": props}
     try:
-        S.post("https://api.notion.com/v1/pages", headers=NOTION_HEADERS, json=payload, timeout=NOTION_TIMEOUT)
+        S.post("https://api.notion.com/v1/pages",
+               headers=NOTION_HEADERS, json=payload, timeout=NOTION_TIMEOUT)
     except requests.exceptions.RequestException:
-        pass  # ログは失敗しても全体は止めない
+        pass  # ログ失敗は無視
 
-def upsert_notion(data, db_id, network_prefix=None):
-    """一覧DBを差分更新（TimestampはTEXT）＋ログ1行"""
+def upsert_notion(data_iso, db_id, network_prefix=None):
+    """
+    data_iso: [[ip, iso_ts or ""]]
+    main DB は Timestamp(date型) と Status(select) を差分時のみ更新
+    ログDBは毎回1行追加
+    """
     try:
         page_map = fetch_pages_map(db_id)
     except requests.exceptions.RequestException as e:
         print(f"❌ Notion DB query 失敗: {e}")
         return
 
-    for ip, timestamp in data:
-        status_name = "接続" if timestamp else "接続不可"
+    for ip, ts_iso in data_iso:
+        status_name = "接続" if ts_iso else "接続不可"
         pm = page_map.get(ip)
 
         if not pm:
             # 新規作成
-            payload = {
+            create_payload = {
                 "parent": {"database_id": db_id},
                 "properties": {
                     "IP Address": {"title": [{"text": {"content": ip}}]},
-                    "Timestamp": {"rich_text": [{"text": {"content": timestamp or ""}}]},
-                    "Status": {"select": {"name": status_name}},
+                    "Timestamp": {"date": {"start": ts_iso}} if ts_iso else {"date": None},
+                    "Status": {"select": {"name": status_name}}
                 }
             }
             try:
-                S.post("https://api.notion.com/v1/pages", headers=NOTION_HEADERS, json=payload, timeout=NOTION_TIMEOUT)
+                S.post("https://api.notion.com/v1/pages",
+                       headers=NOTION_HEADERS, json=create_payload, timeout=NOTION_TIMEOUT)
             except requests.exceptions.RequestException as e:
                 print(f"❌ Notion作成失敗: {ip} - {e}")
-            create_log_record(ip, timestamp, status_name, network_prefix)
-            time.sleep(0.03)
+            create_log_record(ip, ts_iso, status_name, network_prefix)
+            time.sleep(0.02)
             continue
 
-        # 差分あり？
-        if pm.get("ts", "") != (timestamp or "") or pm.get("status", "") != status_name:
+        # 差分がある時だけ更新
+        if pm.get("ts", "") != (ts_iso or "") or pm.get("status", "") != status_name:
             try:
                 S.patch(
                     f"https://api.notion.com/v1/pages/{pm['id']}",
                     headers=NOTION_HEADERS,
                     json={"properties": {
-                        "Timestamp": {"rich_text": [{"text": {"content": timestamp or ""}}]},
-                        "Status": {"select": {"name": status_name}},
+                        "Timestamp": {"date": {"start": ts_iso}} if ts_iso else {"date": None},
+                        "Status": {"select": {"name": status_name}}
                     }},
                     timeout=NOTION_TIMEOUT
                 )
             except requests.exceptions.RequestException as e:
                 print(f"❌ Notion更新失敗: {ip} - {e}")
 
-        # ログ1行（毎回）
-        create_log_record(ip, timestamp, status_name, network_prefix)
-        time.sleep(0.03)
+        # ログは毎回1行
+        create_log_record(ip, ts_iso, status_name, network_prefix)
+        time.sleep(0.02)  # 429対策の軽い間引き
 
 # ========= Main =========
 if __name__ == "__main__":
     prefixes = ["192.168.10.", "192.168.80."]
 
     for prefix in prefixes:
-        # 1) 並列 ping
-        results = ping_subnet(prefix, workers=PING_WORKERS)
-        alive = sum(1 for _, ts in results if ts)
+        # 1) 並列 ping（Sheets用とNotion用の時刻を用意）
+        results_human, results_iso = ping_subnet(prefix, workers=PING_WORKERS)
+        alive = sum(1 for _, ts in results_iso if ts)
         print(f"📡 {prefix} Alive: {alive}/254")
 
         # 2) Sheets：退避→メイン更新→ログ列追加
         sheet = prefix.replace(".", "_")
-        write_to_sheets_with_backup(results, sheet, f"{sheet}_log")
+        write_to_sheets_with_backup(results_human, sheet, f"{sheet}_log")
 
-        # 3) Notion：差分更新 + ログ1行
-        upsert_notion(results, NOTION_DB_ID, network_prefix=prefix)
+        # 3) Notion：差分のみ更新 + ログDBへ毎回1行（Timestampはdate型）
+        upsert_notion(results_iso, NOTION_DB_ID, network_prefix=prefix)
 
     print("🏁 全処理完了！")
