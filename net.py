@@ -11,9 +11,9 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 # ========= 設定（必要なら変更） =========
-PING_WORKERS = 100            # ping 並列数（Raspberry Piなら 80〜128 目安）
-NOTION_TIMEOUT = 10           # Notion API タイムアウト秒
-NOTION_BACKOFF = 0.4          # Notion query ページング間の待ち（429対策）
+PING_WORKERS   = 100   # ping 並列数（Raspberry Piなら 80〜128 目安）
+NOTION_TIMEOUT = 10    # Notion API タイムアウト秒
+NOTION_BACKOFF = 0.4   # Notion query ページング間の待ち（429対策）
 
 # ========= ENV =========
 load_dotenv()
@@ -80,14 +80,12 @@ def write_to_sheets_with_backup(data, sheet_name, log_sheet_name):
             prev_col = [row[1] if len(row) > 1 else "" for row in current_vals[1:]]
             backup_col = [datetime.now().strftime("%Y-%m-%d %H:%M:%S")] + prev_col
             col_count = log_sheet.col_count
-            # 必要なら列増設
             if log_sheet.col_count < col_count + 1:
                 log_sheet.add_cols((col_count + 1) - log_sheet.col_count)
             rng = gspread.utils.rowcol_to_a1(1, col_count + 1) + ":" + gspread.utils.rowcol_to_a1(len(backup_col), col_count + 1)
             log_sheet.update([[v] for v in backup_col], range_name=rng)
     except Exception:
-        # 退避失敗は無視（続行）
-        pass
+        pass  # 退避失敗は無視
 
     # メイン上書き（ヘッダ含む）
     values = [["IP Address", "Timestamp"]] + data
@@ -128,9 +126,38 @@ def ping_subnet(prefix, workers=PING_WORKERS):
     results.sort(key=lambda x: int(x[0].split(".")[-1]))  # IP末尾で整列
     return results
 
+# ========= Notion ユーティリティ =========
+def get_db_properties(db_id):
+    if not db_id:
+        return {}
+    try:
+        r = S.get(f"https://api.notion.com/v1/databases/{db_id}", headers=NOTION_HEADERS, timeout=NOTION_TIMEOUT)
+        r.raise_for_status()
+        return r.json().get("properties", {})
+    except requests.exceptions.RequestException:
+        return {}
+
+MAIN_DB_PROPS = get_db_properties(NOTION_DB_ID)
+LOG_DB_PROPS  = get_db_properties(NOTION_LOGS_DB_ID)
+
+def has_prop_in(props, name, type_):
+    p = props.get(name)
+    return p and p.get("type") == type_
+
+def build_timestamp_prop(timestamp_str, db_props):
+    """DBの Timestamp が date なら date、そうでなければ rich_text を返す"""
+    if has_prop_in(db_props, "Timestamp", "date"):
+        if timestamp_str:
+            ts_iso = timestamp_str.replace(" ", "T")
+            return {"date": {"start": ts_iso}}
+        else:
+            return {"date": None}
+    else:
+        return {"rich_text": [{"text": {"content": timestamp_str or ""}}]}
+
 # ========= Notion（高速化：DB query だけで差分判定） =========
 def fetch_pages_map(db_id):
-    """ip -> {'id': page_id, 'ts': 'YYYY-..', 'status': '接続/接続不可'}"""
+    """ip -> {'id': page_id, 'ts': string(ISO or text), 'status': '接続/接続不可'}"""
     page_map = {}
     url = f"https://api.notion.com/v1/databases/{db_id}/query"
     payload = {"page_size": 100}
@@ -144,71 +171,64 @@ def fetch_pages_map(db_id):
             ip = title[0]["text"]["content"] if title else None
             if not ip:
                 continue
+
+            ts_prop = props.get("Timestamp", {})
             ts = ""
-            try:
-                ts = props.get("Timestamp", {}).get("rich_text", [{}])[0].get("text", {}).get("content", "")
-            except Exception:
-                pass
+            if ts_prop.get("type") == "date":
+                ts = (ts_prop.get("date") or {}).get("start", "") or ""
+                # 差分判定は文字列比較でOK（空文字との比較も同じ）
+                if ts and "T" in ts and ts.endswith("Z"):
+                    # UTC ISO なら必要に応じてローカルに変換したい場合はここで（今回は文字列比較だけなので不要）
+                    pass
+            else:
+                try:
+                    ts = ts_prop.get("rich_text", [{}])[0].get("text", {}).get("content", "")
+                except Exception:
+                    ts = ""
+
             status = props.get("Status", {}).get("select", {}).get("name", "")
             page_map[ip] = {"id": row["id"], "ts": ts, "status": status}
+
         if not data.get("has_more"):
             break
         payload["start_cursor"] = data.get("next_cursor")
         time.sleep(NOTION_BACKOFF)
     return page_map
 
-# 追加: DBスキーマを一度だけ取得して、存在/型チェック
-def get_db_properties(db_id):
-    try:
-        r = S.get(f"https://api.notion.com/v1/databases/{db_id}", headers=NOTION_HEADERS, timeout=NOTION_TIMEOUT)
-        r.raise_for_status()
-        return r.json().get("properties", {})
-    except requests.exceptions.RequestException as e:
-        print(f"❌ Notion DB schema 取得失敗: {e}")
-        return {}
-
-LOG_DB_PROPS = get_db_properties(NOTION_LOGS_DB_ID) if NOTION_LOGS_DB_ID else {}
-
-def has_prop(name, type_):
-    p = LOG_DB_PROPS.get(name)
-    return p and p.get("type") == type_
-
-# 修正: 失敗時に内容を表示 / 存在しないプロパティは送らない
 def create_log_record(ip, timestamp, status_name, network_prefix=None):
     if not NOTION_LOGS_DB_ID:
-        print("⚠️ NOTION_LOGS_DB_ID が未設定です。ログ作成をスキップ。")
         return
 
-    ts_iso = timestamp.replace(" ", "T") if timestamp else None
-
     props = {}
-    if has_prop("IP Address", "title"):
+
+    # 必須: タイトル
+    if has_prop_in(LOG_DB_PROPS, "IP Address", "title"):
         props["IP Address"] = {"title": [{"text": {"content": ip}}]}
     else:
-        print("⚠️ ログDBに title プロパティ『IP Address』がありません。")
-        return  # titleが無いDBにはページを作れない
+        # タイトルが無いDBにはページ作成できない
+        return
 
-    if has_prop("Status", "select"):
+    # 任意: ステータス
+    if has_prop_in(LOG_DB_PROPS, "Status", "select"):
         props["Status"] = {"select": {"name": status_name}}
 
-    if ts_iso and has_prop("Timestamp", "date"):
-        props["Timestamp"] = {"date": {"start": ts_iso}}
+    # 任意: Timestamp（ログDBは date 推奨）
+    if has_prop_in(LOG_DB_PROPS, "Timestamp", "date"):
+        ts_iso = timestamp.replace(" ", "T") if timestamp else None
+        props["Timestamp"] = {"date": {"start": ts_iso}} if ts_iso else {"date": None}
+    elif has_prop_in(LOG_DB_PROPS, "Timestamp", "rich_text"):
+        props["Timestamp"] = {"rich_text": [{"text": {"content": timestamp or ""}}]}
 
-    if network_prefix and has_prop("Network", "select"):
+    # 任意: Network（select 推奨）
+    if network_prefix and has_prop_in(LOG_DB_PROPS, "Network", "select"):
         props["Network"] = {"select": {"name": network_prefix}}
 
     payload = {"parent": {"database_id": NOTION_LOGS_DB_ID}, "properties": props}
     try:
-        res = S.post("https://api.notion.com/v1/pages",
-                     headers=NOTION_HEADERS, json=payload, timeout=NOTION_TIMEOUT)
-        if not (200 <= res.status_code < 300):
-            print(f"❌ ログ作成失敗 {res.status_code}: {res.text[:300]}")
-        else:
-            # 成功時の確認（任意）
-            # print(f"📝 Log OK: {ip} {status_name} {timestamp or '—'}")
-            pass
-    except requests.exceptions.RequestException as e:
-        print(f"❌ ログ作成通信失敗: {e}")
+        S.post("https://api.notion.com/v1/pages",
+               headers=NOTION_HEADERS, json=payload, timeout=NOTION_TIMEOUT)
+    except requests.exceptions.RequestException:
+        pass  # ログは落ちても全体停止しない
 
 def upsert_notion(data, db_id, network_prefix=None):
     try:
@@ -222,20 +242,20 @@ def upsert_notion(data, db_id, network_prefix=None):
         pm = page_map.get(ip)
 
         if not pm:
-            # 新規作成（最小プロパティだけ）
+            # 新規作成
             create_payload = {
                 "parent": {"database_id": db_id},
                 "properties": {
                     "IP Address": {"title": [{"text": {"content": ip}}]},
-                    "Timestamp": {"rich_text": [{"text": {"content": timestamp or ""}}]},
+                    "Timestamp": build_timestamp_prop(timestamp, MAIN_DB_PROPS),
                     "Status": {"select": {"name": status_name}}
                 }
             }
             try:
-                S.post("https://api.notion.com/v1/pages", headers=NOTION_HEADERS, json=create_payload, timeout=NOTION_TIMEOUT)
+                S.post("https://api.notion.com/v1/pages",
+                       headers=NOTION_HEADERS, json=create_payload, timeout=NOTION_TIMEOUT)
             except requests.exceptions.RequestException as e:
                 print(f"❌ Notion作成失敗: {ip} - {e}")
-            # ログは毎回1行
             create_log_record(ip, timestamp, status_name, network_prefix)
             time.sleep(0.03)
             continue
@@ -247,7 +267,7 @@ def upsert_notion(data, db_id, network_prefix=None):
                     f"https://api.notion.com/v1/pages/{pm['id']}",
                     headers=NOTION_HEADERS,
                     json={"properties": {
-                        "Timestamp": {"rich_text": [{"text": {"content": timestamp or ""}}]},
+                        "Timestamp": build_timestamp_prop(timestamp, MAIN_DB_PROPS),
                         "Status": {"select": {"name": status_name}}
                     }},
                     timeout=NOTION_TIMEOUT
@@ -255,9 +275,9 @@ def upsert_notion(data, db_id, network_prefix=None):
             except requests.exceptions.RequestException as e:
                 print(f"❌ Notion更新失敗: {ip} - {e}")
 
-        # ログは毎回1行（要件どおり）
+        # ログは毎回1行
         create_log_record(ip, timestamp, status_name, network_prefix)
-        time.sleep(0.03)  # 軽く間引き（429対策）
+        time.sleep(0.03)  # 429対策
 
 # ========= Main =========
 if __name__ == "__main__":
