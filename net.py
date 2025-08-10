@@ -157,23 +157,58 @@ def fetch_pages_map(db_id):
         time.sleep(NOTION_BACKOFF)
     return page_map
 
+# 追加: DBスキーマを一度だけ取得して、存在/型チェック
+def get_db_properties(db_id):
+    try:
+        r = S.get(f"https://api.notion.com/v1/databases/{db_id}", headers=NOTION_HEADERS, timeout=NOTION_TIMEOUT)
+        r.raise_for_status()
+        return r.json().get("properties", {})
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Notion DB schema 取得失敗: {e}")
+        return {}
+
+LOG_DB_PROPS = get_db_properties(NOTION_LOGS_DB_ID) if NOTION_LOGS_DB_ID else {}
+
+def has_prop(name, type_):
+    p = LOG_DB_PROPS.get(name)
+    return p and p.get("type") == type_
+
+# 修正: 失敗時に内容を表示 / 存在しないプロパティは送らない
 def create_log_record(ip, timestamp, status_name, network_prefix=None):
     if not NOTION_LOGS_DB_ID:
+        print("⚠️ NOTION_LOGS_DB_ID が未設定です。ログ作成をスキップ。")
         return
+
     ts_iso = timestamp.replace(" ", "T") if timestamp else None
-    props = {
-        "IP Address": {"title": [{"text": {"content": ip}}]},
-        "Status": {"select": {"name": status_name}},
-    }
-    if ts_iso:
+
+    props = {}
+    if has_prop("IP Address", "title"):
+        props["IP Address"] = {"title": [{"text": {"content": ip}}]}
+    else:
+        print("⚠️ ログDBに title プロパティ『IP Address』がありません。")
+        return  # titleが無いDBにはページを作れない
+
+    if has_prop("Status", "select"):
+        props["Status"] = {"select": {"name": status_name}}
+
+    if ts_iso and has_prop("Timestamp", "date"):
         props["Timestamp"] = {"date": {"start": ts_iso}}
-    if network_prefix:
-        props["Network"] = {"select": {"name": network_prefix}}  # select のほうがフィルタ楽
+
+    if network_prefix and has_prop("Network", "select"):
+        props["Network"] = {"select": {"name": network_prefix}}
+
     payload = {"parent": {"database_id": NOTION_LOGS_DB_ID}, "properties": props}
     try:
-        S.post("https://api.notion.com/v1/pages", headers=NOTION_HEADERS, json=payload, timeout=NOTION_TIMEOUT)
-    except requests.exceptions.RequestException:
-        pass  # ログは落ちても全体停止しない
+        res = S.post("https://api.notion.com/v1/pages",
+                     headers=NOTION_HEADERS, json=payload, timeout=NOTION_TIMEOUT)
+        if not (200 <= res.status_code < 300):
+            print(f"❌ ログ作成失敗 {res.status_code}: {res.text[:300]}")
+        else:
+            # 成功時の確認（任意）
+            # print(f"📝 Log OK: {ip} {status_name} {timestamp or '—'}")
+            pass
+    except requests.exceptions.RequestException as e:
+        print(f"❌ ログ作成通信失敗: {e}")
 
 def upsert_notion(data, db_id, network_prefix=None):
     try:
