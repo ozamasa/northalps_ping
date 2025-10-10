@@ -11,9 +11,9 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 # ========= 設定 =========
-PING_WORKERS   = 100   # ping 並列数（Raspberry Piなら 80〜128 目安）
-NOTION_TIMEOUT = 10    # Notion API タイムアウト秒
-NOTION_BACKOFF = 0.4   # Notion query ページング間の待ち（429対策）
+PING_WORKERS   = 100
+NOTION_TIMEOUT = 10
+NOTION_BACKOFF = 0.4
 JST            = timezone(timedelta(hours=9))
 
 # ========= ENV =========
@@ -21,8 +21,7 @@ load_dotenv()
 GOOGLE_CREDENTIALS_PATH = os.getenv("GOOGLE_CREDENTIALS_PATH")
 SPREADSHEET_NAME       = os.getenv("SPREADSHEET_NAME")
 NOTION_TOKEN           = os.getenv("NOTION_TOKEN")
-NOTION_DB_ID           = os.getenv("NOTION_DATABASE_ID")      # IP一覧DB
-NOTION_LOGS_DB_ID      = os.getenv("NOTION_LOGS_DB_ID")       # ログDB（1つ）
+NOTION_DB_ID           = os.getenv("NOTION_DATABASE_ID")
 
 NOTION_HEADERS = {
     "Authorization": f"Bearer {NOTION_TOKEN}",
@@ -39,7 +38,7 @@ def create_session():
         status_forcelist=(429, 500, 502, 503, 504),
         allowed_methods=frozenset(["GET", "POST", "PATCH"])
     )
-    adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=50)
+    adapter = HTTPAdapter(max_retries=retry)
     s.mount("https://", adapter)
     s.mount("http://", adapter)
     return s
@@ -55,6 +54,11 @@ def gs_auth():
     creds = ServiceAccountCredentials.from_json_keyfile_name(GOOGLE_CREDENTIALS_PATH, scope)
     return gspread.authorize(creds)
 
+def insert_log_column(log_ws, timestamp, values):
+    # values: 1行目見出しを含まない Timestamp 値（IP順）
+    new_col = [timestamp] + values
+    log_ws.insert_cols([new_col], col=2)
+
 def write_to_sheets_with_backup(data, sheet_name, log_sheet_name):
     gc = gs_auth()
     ss = gc.open(SPREADSHEET_NAME)
@@ -65,40 +69,24 @@ def write_to_sheets_with_backup(data, sheet_name, log_sheet_name):
     except gspread.exceptions.WorksheetNotFound:
         sheet = ss.add_worksheet(title=sheet_name, rows="300", cols="2")
 
-    # ログ
-    try:
-        log_sheet = ss.worksheet(log_sheet_name)
-    except gspread.exceptions.WorksheetNotFound:
-        log_sheet = ss.add_worksheet(title=log_sheet_name, rows="300", cols="2")
-        ips = [ip for ip, _ in data]
-        log_sheet.update([["IP Address"] + ips], range_name="A1")
-
-    # メインB列をログ右端に退避（バックアップ）
-    try:
-        current_vals = sheet.get_all_values()
-        if current_vals and len(current_vals) >= 2:
-            prev_col = [row[1] if len(row) > 1 else "" for row in current_vals[1:]]
-            backup_col = [datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")] + prev_col
-            col_count = log_sheet.col_count + 1
-            log_sheet.add_cols(max(0, col_count - log_sheet.col_count))
-            rng = gspread.utils.rowcol_to_a1(1, col_count) + ":" + gspread.utils.rowcol_to_a1(len(backup_col), col_count)
-            log_sheet.update([[v] for v in backup_col], range_name=rng)
-    except Exception:
-        pass
-
-    # メイン更新
     values = [["IP Address", "Timestamp"]] + data
     sheet.batch_update([{
         "range": f"A1:B{len(values)}",
         "values": values
     }])
 
-    # 今回の値もログ右端に追記
-    run_col = [datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")] + [ts for _, ts in data]
-    col_count = log_sheet.col_count + 1
-    log_sheet.add_cols(max(0, col_count - log_sheet.col_count))
-    rng = gspread.utils.rowcol_to_a1(1, col_count) + ":" + gspread.utils.rowcol_to_a1(len(run_col), col_count)
-    log_sheet.update([[v] for v in run_col], range_name=rng)
+    # ログ
+    try:
+        log_ws = ss.worksheet(log_sheet_name)
+    except gspread.exceptions.WorksheetNotFound:
+        log_ws = ss.add_worksheet(title=log_sheet_name, rows="300", cols="2")
+        ips = [ip for ip, _ in data]
+        log_ws.update([["IP Address"] + ips], range_name="A1")
+
+    # Timestamp列だけを取り出して、2列目に挿入（右にスライド）
+    timestamp = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
+    timestamps = [ts for _, ts in data]
+    insert_log_column(log_ws, timestamp, timestamps)
 
 # ========= Ping =========
 def ping_ip(ip):
@@ -121,139 +109,62 @@ def ping_subnet(prefix, workers=PING_WORKERS):
             ip = futs[fut]
             ok = fut.result()
             results.append([ip, ts_now if ok else ""])
-    results.sort(key=lambda x: int(x[0].split(".")[-1]))  # IP末尾で整列
+    results.sort(key=lambda x: int(x[0].split(".")[-1]))
     return results
 
-# ========= Notion helpers =========
-def get_db_properties(db_id):
+# ========= Notion: 一覧DBのみ更新 =========
+def upsert_notion(data, db_id):
     try:
-        r = S.get(f"https://api.notion.com/v1/databases/{db_id}", headers=NOTION_HEADERS, timeout=NOTION_TIMEOUT)
+        r = S.post(f"https://api.notion.com/v1/databases/{db_id}/query",
+                   headers=NOTION_HEADERS, json={"page_size": 100}, timeout=NOTION_TIMEOUT)
         r.raise_for_status()
-        return r.json().get("properties", {})
-    except requests.exceptions.RequestException:
-        return {}
-
-MAIN_DB_PROPS = get_db_properties(NOTION_DB_ID) if NOTION_DB_ID else {}
-LOG_DB_PROPS  = get_db_properties(NOTION_LOGS_DB_ID) if NOTION_LOGS_DB_ID else {}
-
-def has_prop(props, name, type_):
-    p = props.get(name)
-    return p and p.get("type") == type_
-
-def jst_iso_from_str(ts_str):
-    # 'YYYY-MM-DD HH:MM:SS' -> 'YYYY-MM-DDTHH:MM:SS+09:00'
-    dt = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
-    return dt.replace(tzinfo=JST).isoformat(timespec="seconds")
-
-def fetch_pages_map(db_id):
-    # ip -> {'id': page_id, 'ts': (既存Timestamp文字列), 'status': '接続/接続不可'}
-    page_map = {}
-    url = f"https://api.notion.com/v1/databases/{db_id}/query"
-    payload = {"page_size": 100}
-    while True:
-        r = S.post(url, headers=NOTION_HEADERS, json=payload, timeout=NOTION_TIMEOUT)
-        r.raise_for_status()
-        data = r.json()
-        for row in data.get("results", []):
-            props = row.get("properties", {})
-            title = props.get("IP Address", {}).get("title", [])
-            ip = title[0]["text"]["content"] if title else None
-            if not ip:
-                continue
-
-            # Timestamp の既存値を文字列に吸い出し（date型 or rich_text 両対応）
-            ts_existing = ""
-            if has_prop(MAIN_DB_PROPS, "Timestamp", "date"):
-                ts_existing = (props.get("Timestamp", {}).get("date") or {}).get("start") or ""
-            else:
-                ts_existing = props.get("Timestamp", {}).get("rich_text", [{}])[0].get("text", {}).get("content", "") or ""
-
-            status = props.get("Status", {}).get("select", {}).get("name", "")
-            page_map[ip] = {"id": row["id"], "ts": ts_existing, "status": status}
-
-        if not data.get("has_more"):
-            break
-        payload["start_cursor"] = data.get("next_cursor")
-        time.sleep(NOTION_BACKOFF)
-    return page_map
-
-# ========= Notion: メインDB upsert（ログ書き込みなしに変更）=========
-def upsert_notion(data, db_id, network_prefix=None):
-    try:
-        page_map = fetch_pages_map(db_id)
+        pages = r.json().get("results", [])
     except requests.exceptions.RequestException as e:
-        print(f"❌ Notion DB query 失敗: {e}")
+        print(f"❌ Notion DB 読み込み失敗: {e}")
         return
 
-    ts_is_date = has_prop(MAIN_DB_PROPS, "Timestamp", "date")
-    ts_is_text = has_prop(MAIN_DB_PROPS, "Timestamp", "rich_text")
+    page_map = {}
+    for p in pages:
+        props = p["properties"]
+        title = props["IP Address"]["title"]
+        if title:
+            ip = title[0]["text"]["content"]
+            page_map[ip] = p["id"]
 
-    for ip, timestamp in data:
-        status_name = "接続" if timestamp else "接続不可"
-        pm = page_map.get(ip)
+    for ip, ts in data:
+        status = "接続" if ts else "接続不可"
+        props = {
+            "IP Address": {"title": [{"text": {"content": ip}}]},
+            "Timestamp": {"rich_text": [{"text": {"content": ts}}]} if ts else {"rich_text": []},
+            "Status": {"select": {"name": status}},
+        }
 
-        if not pm:
-            props = {
-                "IP Address": {"title": [{"text": {"content": ip}}]},
-                "Status": {"select": {"name": status_name}}
-            }
-            if timestamp:
-                if ts_is_date:
-                    props["Timestamp"] = {"date": {"start": jst_iso_from_str(timestamp)}}
-                elif ts_is_text:
-                    props["Timestamp"] = {"rich_text": [{"text": {"content": timestamp}}]}
-            else:
-                if ts_is_date:
-                    props["Timestamp"] = {"date": None}
-                elif ts_is_text:
-                    props["Timestamp"] = {"rich_text": []}
-
+        if ip in page_map:
             try:
-                S.post("https://api.notion.com/v1/pages", headers=NOTION_HEADERS, json={"parent": {"database_id": db_id}, "properties": props}, timeout=NOTION_TIMEOUT)
+                S.patch(f"https://api.notion.com/v1/pages/{page_map[ip]}",
+                        headers=NOTION_HEADERS, json={"properties": props}, timeout=NOTION_TIMEOUT)
+            except requests.exceptions.RequestException:
+                pass
+        else:
+            try:
+                S.post("https://api.notion.com/v1/pages",
+                       headers=NOTION_HEADERS, json={"parent": {"database_id": db_id}, "properties": props}, timeout=NOTION_TIMEOUT)
             except requests.exceptions.RequestException:
                 pass
 
-            time.sleep(0.03)
-            continue
-
-        # 差分チェックと更新
-        want_ts_str = jst_iso_from_str(timestamp) if ts_is_date and timestamp else timestamp or ""
-        need_update = (pm.get("status", "") != status_name) or (pm.get("ts", "") != want_ts_str)
-
-        if need_update:
-            props = {"Status": {"select": {"name": status_name}}}
-            if ts_is_date:
-                props["Timestamp"] = {"date": {"start": want_ts_str}} if timestamp else {"date": None}
-            elif ts_is_text:
-                props["Timestamp"] = {"rich_text": [{"text": {"content": timestamp}}]} if timestamp else {"rich_text": []}
-
-            try:
-                S.patch(
-                    f"https://api.notion.com/v1/pages/{pm['id']}",
-                    headers=NOTION_HEADERS,
-                    json={"properties": props},
-                    timeout=NOTION_TIMEOUT
-                )
-            except requests.exceptions.RequestException:
-                pass
-
-        time.sleep(0.03)
+        time.sleep(0.05)
 
 # ========= Main =========
 if __name__ == "__main__":
     prefixes = ["192.168.10.", "192.168.80."]
 
     for prefix in prefixes:
-        # 1) 並列 ping
-        results = ping_subnet(prefix, workers=PING_WORKERS)
+        results = ping_subnet(prefix)
         alive = sum(1 for _, ts in results if ts)
         print(f"📡 {prefix} Alive: {alive}/254")
 
-        # 2) Sheets：退避→メイン更新→ログ列追加
         sheet = prefix.replace(".", "_").strip("_")
         write_to_sheets_with_backup(results, sheet, f"{sheet}_log")
-
-        # 3) Notion：差分のみ更新 + ログDBへ毎回1行（TimestampはJSTのdate型優先）
-        upsert_notion(results, NOTION_DB_ID, network_prefix=prefix)
+        upsert_notion(results, NOTION_DB_ID)
 
     print("🏁 全処理完了！")
