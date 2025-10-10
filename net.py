@@ -172,6 +172,6 @@ if __name__ == "__main__":
         write_to_sheets_with_backup(results, sheet_name, log_sheet_name)
 
         # 3) Notion メインDB更新
-        upsert_notion(results, NOTION_DB_ID, network_prefix=prefix)
+        upsert_notion(results, NOTION_DB_ID)
 
     print("🏁 全処理完了！")
