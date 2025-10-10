@@ -159,14 +159,19 @@ if __name__ == "__main__":
     prefixes = ["192.168.10.", "192.168.80."]
 
     for prefix in prefixes:
+        base_name = prefix.replace(".", "_")
+        sheet_name = base_name + "_"         # 例: 192_168_10_
+        log_sheet_name = base_name + "_log"  # 例: 192_168_10_log
+
+        # 1) 並列 ping
         results = ping_subnet(prefix, workers=PING_WORKERS)
         alive = sum(1 for _, ts in results if ts)
         print(f"📡 {prefix} Alive: {alive}/254")
 
-        sheet_name = prefix.replace(".", "_") + "_"
-        log_sheet_name = prefix.replace(".", "_") + "_log"
-
+        # 2) Google Sheets 書き込み（退避＋ログ列追加）
         write_to_sheets_with_backup(results, sheet_name, log_sheet_name)
+
+        # 3) Notion メインDB更新
         upsert_notion(results, NOTION_DB_ID, network_prefix=prefix)
 
     print("🏁 全処理完了！")
