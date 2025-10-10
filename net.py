@@ -56,7 +56,6 @@ def gs_auth():
     return gspread.authorize(creds)
 
 def write_to_sheets_with_backup(data, sheet_name, log_sheet_name):
-    """メイン上書き + 旧メインB列をログへ退避 + 今回の結果もログ右端に追加"""
     gc = gs_auth()
     ss = gc.open(SPREADSHEET_NAME)
 
@@ -74,33 +73,31 @@ def write_to_sheets_with_backup(data, sheet_name, log_sheet_name):
         ips = [ip for ip, _ in data]
         log_sheet.update([["IP Address"] + ips], range_name="A1")
 
-    # 退避：メインB列をログ右端にコピー
+    # メインB列をログ右端に退避（バックアップ）
     try:
-        current_vals = sheet.get_all_values()  # [[IP, TS], ...]
+        current_vals = sheet.get_all_values()
         if current_vals and len(current_vals) >= 2:
             prev_col = [row[1] if len(row) > 1 else "" for row in current_vals[1:]]
             backup_col = [datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")] + prev_col
-            col_count = log_sheet.col_count
-            if log_sheet.col_count < col_count + 1:
-                log_sheet.add_cols((col_count + 1) - log_sheet.col_count)
-            rng = gspread.utils.rowcol_to_a1(1, col_count + 1) + ":" + gspread.utils.rowcol_to_a1(len(backup_col), col_count + 1)
+            col_count = log_sheet.col_count + 1
+            log_sheet.add_cols(max(0, col_count - log_sheet.col_count))
+            rng = gspread.utils.rowcol_to_a1(1, col_count) + ":" + gspread.utils.rowcol_to_a1(len(backup_col), col_count)
             log_sheet.update([[v] for v in backup_col], range_name=rng)
     except Exception:
-        pass  # 退避失敗は無視
+        pass
 
-    # メイン上書き（ヘッダ含む）
+    # メイン更新
     values = [["IP Address", "Timestamp"]] + data
     sheet.batch_update([{
         "range": f"A1:B{len(values)}",
         "values": values
     }])
 
-    # 今回分もログ右端に追記
-    col_count = log_sheet.col_count
+    # 今回の値もログ右端に追記
     run_col = [datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")] + [ts for _, ts in data]
-    if log_sheet.col_count < col_count + 1:
-        log_sheet.add_cols((col_count + 1) - log_sheet.col_count)
-    rng = gspread.utils.rowcol_to_a1(1, col_count + 1) + ":" + gspread.utils.rowcol_to_a1(len(run_col), col_count + 1)
+    col_count = log_sheet.col_count + 1
+    log_sheet.add_cols(max(0, col_count - log_sheet.col_count))
+    rng = gspread.utils.rowcol_to_a1(1, col_count) + ":" + gspread.utils.rowcol_to_a1(len(run_col), col_count)
     log_sheet.update([[v] for v in run_col], range_name=rng)
 
 # ========= Ping =========
@@ -144,12 +141,12 @@ def has_prop(props, name, type_):
     return p and p.get("type") == type_
 
 def jst_iso_from_str(ts_str):
-    """'YYYY-MM-DD HH:MM:SS' -> 'YYYY-MM-DDTHH:MM:SS+09:00'"""
+    # 'YYYY-MM-DD HH:MM:SS' -> 'YYYY-MM-DDTHH:MM:SS+09:00'
     dt = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
     return dt.replace(tzinfo=JST).isoformat(timespec="seconds")
 
 def fetch_pages_map(db_id):
-    """ip -> {'id': page_id, 'ts': (既存Timestamp文字列), 'status': '接続/接続不可'}"""
+    # ip -> {'id': page_id, 'ts': (既存Timestamp文字列), 'status': '接続/接続不可'}
     page_map = {}
     url = f"https://api.notion.com/v1/databases/{db_id}/query"
     payload = {"page_size": 100}
@@ -253,7 +250,7 @@ if __name__ == "__main__":
         print(f"📡 {prefix} Alive: {alive}/254")
 
         # 2) Sheets：退避→メイン更新→ログ列追加
-        sheet = prefix.replace(".", "_")
+        sheet = prefix.replace(".", "_").strip("_")
         write_to_sheets_with_backup(results, sheet, f"{sheet}_log")
 
         # 3) Notion：差分のみ更新 + ログDBへ毎回1行（TimestampはJSTのdate型優先）
