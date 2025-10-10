@@ -180,42 +180,7 @@ def fetch_pages_map(db_id):
         time.sleep(NOTION_BACKOFF)
     return page_map
 
-# ========= Notion: ログDB 1行追加 =========
-def create_log_record(ip, timestamp, status_name, network_prefix=None):
-    if not NOTION_LOGS_DB_ID:
-        return
-
-    props = {}
-
-    # タイトル（必須）
-    if has_prop(LOG_DB_PROPS, "IP Address", "title"):
-        props["IP Address"] = {"title": [{"text": {"content": ip}}]}
-    else:
-        # タイトルが無いDBにはページを作れない
-        return
-
-    # ステータス
-    if has_prop(LOG_DB_PROPS, "Status", "select"):
-        props["Status"] = {"select": {"name": status_name}}
-
-    # タイムスタンプ（date型を優先）
-    if timestamp:
-        if has_prop(LOG_DB_PROPS, "Timestamp", "date"):
-            props["Timestamp"] = {"date": {"start": jst_iso_from_str(timestamp)}}
-        elif has_prop(LOG_DB_PROPS, "Timestamp", "rich_text"):
-            props["Timestamp"] = {"rich_text": [{"text": {"content": timestamp}}]}
-
-    # ネットワーク（あれば）
-    if network_prefix and has_prop(LOG_DB_PROPS, "Network", "select"):
-        props["Network"] = {"select": {"name": network_prefix}}
-
-    payload = {"parent": {"database_id": NOTION_LOGS_DB_ID}, "properties": props}
-    try:
-        S.post("https://api.notion.com/v1/pages", headers=NOTION_HEADERS, json=payload, timeout=NOTION_TIMEOUT)
-    except requests.exceptions.RequestException:
-        pass  # ログは落ちても全体停止しない
-
-# ========= Notion: メインDB upsert =========
+# ========= Notion: メインDB upsert（ログ書き込みなしに変更）=========
 def upsert_notion(data, db_id, network_prefix=None):
     try:
         page_map = fetch_pages_map(db_id)
@@ -230,7 +195,6 @@ def upsert_notion(data, db_id, network_prefix=None):
         status_name = "接続" if timestamp else "接続不可"
         pm = page_map.get(ip)
 
-        # 新規作成
         if not pm:
             props = {
                 "IP Address": {"title": [{"text": {"content": ip}}]},
@@ -242,7 +206,6 @@ def upsert_notion(data, db_id, network_prefix=None):
                 elif ts_is_text:
                     props["Timestamp"] = {"rich_text": [{"text": {"content": timestamp}}]}
             else:
-                # 空で上書き
                 if ts_is_date:
                     props["Timestamp"] = {"date": None}
                 elif ts_is_text:
@@ -253,24 +216,12 @@ def upsert_notion(data, db_id, network_prefix=None):
             except requests.exceptions.RequestException:
                 pass
 
-            create_log_record(ip, timestamp, status_name, network_prefix)
             time.sleep(0.03)
             continue
 
-        # 既存 → 差分判定（文字列で比較）
-        want_ts_str = ""
-        if timestamp:
-            want_ts_str = jst_iso_from_str(timestamp) if ts_is_date else timestamp
-
-        need_update = False
-        if ts_is_date:
-            # 既存（日付ISO, 末尾Zの可能性あり）と、JST ISO をそのまま比較
-            need_update = (pm.get("ts") or "") != want_ts_str
-        else:
-            need_update = (pm.get("ts") or "") != (timestamp or "")
-
-        if pm.get("status", "") != status_name:
-            need_update = True
+        # 差分チェックと更新
+        want_ts_str = jst_iso_from_str(timestamp) if ts_is_date and timestamp else timestamp or ""
+        need_update = (pm.get("status", "") != status_name) or (pm.get("ts", "") != want_ts_str)
 
         if need_update:
             props = {"Status": {"select": {"name": status_name}}}
@@ -289,9 +240,7 @@ def upsert_notion(data, db_id, network_prefix=None):
             except requests.exceptions.RequestException:
                 pass
 
-        # ログは毎回1行
-        create_log_record(ip, timestamp, status_name, network_prefix)
-        time.sleep(0.03)  # 429対策の軽い間隔
+        time.sleep(0.03)
 
 # ========= Main =========
 if __name__ == "__main__":
