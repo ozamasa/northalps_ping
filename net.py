@@ -159,12 +159,14 @@ if __name__ == "__main__":
     prefixes = ["192.168.10.", "192.168.80."]
 
     for prefix in prefixes:
-        results = ping_subnet(prefix)
+        results = ping_subnet(prefix, workers=PING_WORKERS)
         alive = sum(1 for _, ts in results if ts)
         print(f"📡 {prefix} Alive: {alive}/254")
 
-        sheet = prefix.replace(".", "_").strip("_")
-        write_to_sheets_with_backup(results, sheet, f"{sheet}_log")
-        upsert_notion(results, NOTION_DB_ID)
+        sheet_name = prefix.replace(".", "_") + "_"
+        log_sheet_name = prefix.replace(".", "_") + "_log"
+
+        write_to_sheets_with_backup(results, sheet_name, log_sheet_name)
+        upsert_notion(results, NOTION_DB_ID, network_prefix=prefix)
 
     print("🏁 全処理完了！")
