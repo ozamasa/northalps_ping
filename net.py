@@ -159,9 +159,10 @@ if __name__ == "__main__":
     prefixes = ["192.168.10.", "192.168.80."]
 
     for prefix in prefixes:
-        base_name = prefix.strip(".").replace(".", "_")  # ← 修正ポイント
-        sheet_name = base_name       # 例: 192_168_10
-        log_sheet_name = base_name + "_log"
+        base_name = prefix.rstrip(".").replace(".", "_") + "_"  # 例: 192.168.10. → 192_168_10_
+        sheet_name = base_name                 # 例: 192_168_10_
+        log_sheet_name = base_name + "log"     # 例: 192_168_10_log
+
 
         # ping
         results = ping_subnet(prefix, workers=PING_WORKERS)
