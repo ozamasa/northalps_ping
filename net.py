@@ -11,11 +11,12 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
+
 PING_WORKERS = 100
 API_TIMEOUT = 15
 JST = timezone(timedelta(hours=9))
-
-load_dotenv()
 
 PING_API_URL = os.getenv("PING_API_URL", "https://ping.shiolab.com/api/ping_results")
 INGEST_TOKEN = os.getenv("INGEST_TOKEN", "change-me")
