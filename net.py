@@ -11,26 +11,20 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# ========= 設定 =========
 PING_WORKERS = 100
 API_TIMEOUT = 15
 JST = timezone(timedelta(hours=9))
 
-# ========= ENV =========
 load_dotenv()
 
 PING_API_URL = os.getenv("PING_API_URL", "https://ping.shiolab.com/api/ping_results")
-PING_API_TOKEN = os.getenv("PING_API_TOKEN", "")
-
-# 例:
-# PING_PREFIXES=192.168.10.,192.168.80.,192.168.20.
+INGEST_TOKEN = os.getenv("INGEST_TOKEN", "change-me")
 PREFIXES = [
     p.strip()
     for p in os.getenv("PING_PREFIXES", "192.168.10.,192.168.80.").split(",")
     if p.strip()
 ]
 
-# ========= HTTP Session =========
 def create_session():
     s = requests.Session()
     retry = Retry(
@@ -48,7 +42,6 @@ def create_session():
 
 S = create_session()
 
-# ========= Ping =========
 def ping_ip(ip: str) -> bool:
     sysname = platform.system().lower()
     if sysname == "windows":
@@ -77,7 +70,6 @@ def ping_subnet(prefix: str, workers: int = PING_WORKERS):
     results.sort(key=lambda x: int(x["ip"].split(".")[-1]))
     return results
 
-# ========= API送信 =========
 def send_to_api(results, prefix: str) -> bool:
     payload = {
         "subnet": prefix,
@@ -86,9 +78,8 @@ def send_to_api(results, prefix: str) -> bool:
 
     headers = {
         "Content-Type": "application/json",
+        "X-INGEST-TOKEN": INGEST_TOKEN,
     }
-    if PING_API_TOKEN:
-        headers["Authorization"] = f"Bearer {PING_API_TOKEN}"
 
     try:
         r = S.post(
@@ -97,25 +88,24 @@ def send_to_api(results, prefix: str) -> bool:
             headers=headers,
             timeout=API_TIMEOUT,
         )
-        print(f"📤 API送信 {prefix}: {r.status_code}")
+        print(f"API送信 {prefix}: {r.status_code}")
         print(r.text)
         r.raise_for_status()
         return True
     except requests.exceptions.RequestException as e:
-        print(f"❌ API送信失敗 {prefix}: {e}")
+        print(f"API送信失敗 {prefix}: {e}")
         return False
 
-# ========= Main =========
 if __name__ == "__main__":
-    print("🚀 Ping監視開始")
+    print("Ping監視開始")
 
     for prefix in PREFIXES:
         results = ping_subnet(prefix, workers=PING_WORKERS)
         alive = sum(1 for row in results if row["timestamp"])
-        print(f"📡 {prefix} Alive: {alive}/254")
+        print(f"{prefix} Alive: {alive}/254")
 
         ok = send_to_api(results, prefix)
         if not ok:
-            print(f"⚠️ {prefix} の送信に失敗しました")
+            print(f"{prefix} の送信に失敗しました")
 
-    print("🏁 全処理完了！")
+    print("全処理完了")
