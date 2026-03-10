@@ -20,11 +20,14 @@ JST = timezone(timedelta(hours=9))
 load_dotenv()
 
 PING_API_URL = os.getenv("PING_API_URL", "https://ping.shiolab.com/api/ping_results")
-PING_API_TOKEN = os.getenv("PING_API_TOKEN", "")  # 必要になったら使う
+PING_API_TOKEN = os.getenv("PING_API_TOKEN", "")
 
-# 例: "192.168.10.,192.168.80.,192.168.20."
+# 例:
+# PING_PREFIXES=192.168.10.,192.168.80.,192.168.20.
 PREFIXES = [
-    p.strip() for p in os.getenv("PING_PREFIXES", "192.168.10.,192.168.80.").split(",") if p.strip()
+    p.strip()
+    for p in os.getenv("PING_PREFIXES", "192.168.10.,192.168.80.").split(",")
+    if p.strip()
 ]
 
 # ========= HTTP Session =========
@@ -66,9 +69,12 @@ def ping_subnet(prefix: str, workers: int = PING_WORKERS):
         for fut in as_completed(futures):
             ip = futures[fut]
             ok = fut.result()
-            results.append([ip, ts_now if ok else ""])
+            results.append({
+                "ip": ip,
+                "timestamp": ts_now if ok else ""
+            })
 
-    results.sort(key=lambda x: int(x[0].split(".")[-1]))
+    results.sort(key=lambda x: int(x["ip"].split(".")[-1]))
     return results
 
 # ========= API送信 =========
@@ -101,9 +107,11 @@ def send_to_api(results, prefix: str) -> bool:
 
 # ========= Main =========
 if __name__ == "__main__":
+    print("🚀 Ping監視開始")
+
     for prefix in PREFIXES:
         results = ping_subnet(prefix, workers=PING_WORKERS)
-        alive = sum(1 for _, ts in results if ts)
+        alive = sum(1 for row in results if row["timestamp"])
         print(f"📡 {prefix} Alive: {alive}/254")
 
         ok = send_to_api(results, prefix)
